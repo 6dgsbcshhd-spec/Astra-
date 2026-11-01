@@ -12,7 +12,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'astra-secret';
 
-// База данных
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('render.com') ? { rejectUnauthorized: false } : false,
@@ -47,16 +46,25 @@ async function initDb() {
     const hash = bcrypt.hashSync('admin123', 10);
     await pool.query(
       'INSERT INTO users (phone, name, username, is_creator, is_anonymous, password) VALUES ($1,$2,$3,$4,$5,$6)',
-      ['+8888888888', 'Astra', 'astra', true, true, hash]
+      ['+8888888888', 'Astra Creator', 'astra', true, true, hash]
     );
-    console.log('👑 Создан: +888 888 88 88 / admin123');
   }
 }
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// API
+const auth = async (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'no_token' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    const r = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    req.user = r.rows[0];
+    next();
+  } catch { res.status(401).json({ error: 'invalid_token' }); }
+};
+
 app.post('/api/auth/register', async (req, res) => {
   const { phone, email, password, name } = req.body;
   try {
@@ -78,37 +86,31 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ token: jwt.sign({ id: user.id }, JWT_SECRET), user });
 });
 
-app.get('/api/me', async (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'no_token' });
-  try {
-    const r = await pool.query('SELECT * FROM users WHERE id = $1', [jwt.verify(token, JWT_SECRET).id]);
-    res.json({ user: r.rows[0] });
-  } catch { res.status(401).json({ error: 'invalid' }); }
+app.get('/api/me', auth, (req, res) => res.json({ user: req.user }));
+
+// Вот здесь была ошибка — теперь добавил auth
+app.get('/api/chats', auth, async (req, res) => {
+  const r = await pool.query('SELECT c.* FROM chats c JOIN chat_members cm ON c.id = cm.chat_id WHERE cm.user_id = $1', [req.user.id]);
+  res.json({ chats: r.rows });
 });
 
-app.get('/api/chats', async (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).end();
-  try {
-    const userId = jwt.verify(token, JWT_SECRET).id;
-    const r = await pool.query('SELECT c.* FROM chats c JOIN chat_members cm ON c.id = cm.chat_id WHERE cm.user_id = $1', [userId]);
-    res.json({ chats: r.rows });
-  } catch { res.status(401).end(); }
+app.post('/api/chats', auth, async (req, res) => {
+  const { title, type } = req.body;
+  const r = await pool.query('INSERT INTO chats (title, type) VALUES ($1,$2) RETURNING *', [title || 'Новый чат', type || 'private']);
+  await pool.query('INSERT INTO chat_members (chat_id, user_id) VALUES ($1,$2)', [r.rows[0].id, req.user.id]);
+  res.json(r.rows[0]);
 });
 
-app.get('/api/messages/:chatId', async (req, res) => {
+app.get('/api/messages/:chatId', auth, async (req, res) => {
   const r = await pool.query('SELECT m.*, u.name AS sender_name FROM messages m JOIN users u ON m.sender_id = u.id WHERE m.chat_id = $1 ORDER BY m.created_at', [req.params.chatId]);
   res.json({ messages: r.rows });
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Запуск
 await initDb();
 const server = app.listen(PORT, () => console.log(`✅ Astra on :${PORT}`));
 
-// WebSocket
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', async (ws, req) => {
   const token = new URL(req.url, `http://${req.headers.host}`).searchParams.get('token');
@@ -125,7 +127,6 @@ wss.on('connection', async (ws, req) => {
   });
 });
 
-// Статика
 app.use(express.static(path.join(__dirname, 'dist')));
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/ws')) return res.status(404).end();
